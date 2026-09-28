@@ -44,6 +44,20 @@
               </a>
             </div>
           </div>
+
+          <!-- Groups this user belongs to -->
+          <div class="mt-4">
+            <strong class="d-block mb-2">Groups</strong>
+            {% if user_groups %}
+              {% for grp in user_groups %}
+                <a href="{{ url_for('group_detail', group_id=grp.id) }}" class="badge text-decoration-none me-1 mb-1 {% if grp.role == 'admin' %}bg-danger{% elif grp.role == 'moderator' %}bg-warning text-dark{% else %}bg-primary{% endif %}">
+                  {{ grp.name }}
+                </a>
+              {% endfor %}
+            {% else %}
+              <span class="text-muted">Not in any groups yet.</span>
+            {% endif %}
+          </div>
         </div>
       </div>
     </div>

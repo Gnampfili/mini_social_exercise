@@ -15,6 +15,17 @@
         <div class="mb-3">
           <textarea class="form-control" name="content" rows="3" placeholder="What's on your mind, {{ session.get('username') }}?" required></textarea>
         </div>
+        {% if user_groups %}
+        <div class="mb-3">
+          <label for="post-group" class="form-label">Post to</label>
+          <select class="form-select" id="post-group" name="group_id">
+            <option value="">Everyone (no group)</option>
+            {% for grp in user_groups %}
+            <option value="{{ grp.id }}">{{ grp.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        {% endif %}
         <button type="submit" class="btn btn-primary float-end">Post</button>
       </form>
     </div>
@@ -58,6 +69,9 @@
 </a>
           {% else %}
           <a href="/u/{{ entry.post.user_id }}">{{ user_display(entry.post.username) }} </a>
+          {% endif %}
+          {% if entry.post.group_name %}
+          <a href="{{ url_for('group_detail', group_id=entry.post.group_id) }}" class="badge bg-primary text-decoration-none">{{ entry.post.group_name }}</a>
           {% endif %}
         </h3>
 

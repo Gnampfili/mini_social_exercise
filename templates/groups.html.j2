@@ -1,0 +1,66 @@
+{% extends "base.html.j2" %}
+{% block content %}
+
+<h2 class="text-center border-bottom pb-2 mb-4"><span>Groups</span></h2>
+
+{% if session.get('user_id') %}
+<div class="col-md-8 mx-auto mb-4">
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <h5 class="card-title">Create a new group</h5>
+      <form action="{{ url_for('create_group') }}" method="POST">
+        <div class="mb-3">
+          <label for="group-name" class="form-label">Group name</label>
+          <input type="text" class="form-control" id="group-name" name="name" maxlength="50" placeholder="e.g. DIY Crafters" required>
+        </div>
+        <div class="mb-3">
+          <label for="group-description" class="form-label">Description <span class="text-muted">(optional)</span></label>
+          <textarea class="form-control" id="group-description" name="description" rows="2" placeholder="What's this group about?"></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary float-end">Create Group</button>
+      </form>
+    </div>
+  </div>
+</div>
+{% else %}
+<div class="col-md-8 mx-auto mb-4">
+  <div class="alert alert-info text-center">
+    <a href="{{ url_for('login') }}">Log in</a> to create or join a group.
+  </div>
+</div>
+{% endif %}
+
+<div class="col-md-8 mx-auto">
+  {% if groups %}
+    <div class="row g-3">
+      {% for grp in groups %}
+      <div class="col-md-6">
+        <div class="card h-100 shadow-sm">
+          <div class="card-body d-flex flex-column">
+            <h5 class="card-title mb-1">
+              <a href="{{ url_for('group_detail', group_id=grp.id) }}" class="text-decoration-none">{{ grp.name }}</a>
+              {% if grp.my_role == 'admin' %}
+                <span class="badge bg-danger">Admin</span>
+              {% elif grp.my_role == 'moderator' %}
+                <span class="badge bg-warning text-dark">Moderator</span>
+              {% elif grp.my_role == 'member' %}
+                <span class="badge bg-secondary">Member</span>
+              {% endif %}
+            </h5>
+            <p class="card-text text-muted small mb-2">Created by {{ grp.creator_username }} &middot; {{ grp.created_at|datetimeformat }}</p>
+            <p class="card-text flex-grow-1">{{ grp.description or "No description provided." }}</p>
+            <div class="d-flex justify-content-between align-items-center mt-2">
+              <span class="text-muted small">{{ grp.member_count }} member{{ 's' if grp.member_count != 1 else '' }}</span>
+              <a href="{{ url_for('group_detail', group_id=grp.id) }}" class="btn btn-sm btn-light">View</a>
+            </div>
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="text-center text-muted">No groups yet. Be the first to create one!</p>
+  {% endif %}
+</div>
+
+{% endblock %}

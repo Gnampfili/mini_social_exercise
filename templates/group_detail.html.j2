@@ -1,0 +1,112 @@
+{% extends "base.html.j2" %}
+{% block content %}
+{% from "macros/user_macros.html.j2" import user_display %}
+
+<div class="col-md-8 mx-auto">
+
+  <!-- Group Info Card -->
+  <div class="card shadow-sm mb-4">
+    <div class="card-body">
+      <div class="d-flex justify-content-between align-items-start">
+        <div>
+          <h2 class="card-title mb-1">{{ group.name }}</h2>
+          <p class="text-muted small mb-2">Created by {{ group.creator_username }} &middot; {{ group.created_at|datetimeformat }}</p>
+        </div>
+        {% if my_role == 'admin' %}
+          <span class="badge bg-danger">Admin</span>
+        {% elif my_role == 'moderator' %}
+          <span class="badge bg-warning text-dark">Moderator</span>
+        {% elif my_role == 'member' %}
+          <span class="badge bg-secondary">Member</span>
+        {% endif %}
+      </div>
+
+      <p class="card-text">{{ group.description or "No description provided." }}</p>
+
+      {% if session.get('user_id') %}
+        {% if my_role %}
+          <form action="{{ url_for('leave_group', group_id=group.id) }}" method="POST" onsubmit="return confirm('Are you sure you want to leave this group?');">
+            <button type="submit" class="btn btn-secondary">Leave Group</button>
+          </form>
+        {% else %}
+          <form action="{{ url_for('join_group', group_id=group.id) }}" method="POST">
+            <button type="submit" class="btn btn-primary">Join Group</button>
+          </form>
+        {% endif %}
+      {% else %}
+        <a href="{{ url_for('login') }}" class="btn btn-primary">Log in to join</a>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Members List -->
+  <h4 class="border-bottom pb-2 mb-3">Members ({{ members|length }})</h4>
+  <div class="card shadow-sm mb-4">
+    <ul class="list-group list-group-flush">
+      {% for m in members %}
+      <li class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <div>
+          <a href="/u/{{ m.username }}">{{ user_display(m.username) }}</a>
+          {% if m.role == 'admin' %}
+            <span class="badge bg-danger ms-1">Admin</span>
+          {% elif m.role == 'moderator' %}
+            <span class="badge bg-warning text-dark ms-1">Moderator</span>
+          {% else %}
+            <span class="badge bg-secondary ms-1">Member</span>
+          {% endif %}
+        </div>
+
+        <!-- Role / removal controls -->
+        {% if session.get('user_id') and m.user_id != session.get('user_id') %}
+          <div class="d-flex align-items-center gap-2">
+
+            {% if my_role == 'admin' %}
+              <form action="{{ url_for('change_group_role', group_id=group.id, member_user_id=m.user_id) }}" method="POST" class="d-inline">
+                <select name="role" class="form-select form-select-sm d-inline-block w-auto" onchange="this.form.submit()">
+                  {% for r in group_roles %}
+                    <option value="{{ r }}" {% if r == m.role %}selected{% endif %}>{{ r|capitalize }}</option>
+                  {% endfor %}
+                </select>
+              </form>
+            {% endif %}
+
+            {% if my_role == 'admin' or (my_role == 'moderator' and m.role == 'member') %}
+              <form action="{{ url_for('remove_group_member', group_id=group.id, member_user_id=m.user_id) }}" method="POST" onsubmit="return confirm('Remove this member from the group?');">
+                <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+              </form>
+            {% endif %}
+
+          </div>
+        {% endif %}
+      </li>
+      {% else %}
+      <li class="list-group-item text-muted text-center">No members yet.</li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <!-- Recent Posts in this Group -->
+  <h4 class="border-bottom pb-2 mb-3">Recent Posts</h4>
+  {% if posts %}
+    {% for post in posts %}
+    <div class="card mb-3">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center">
+          <h6 class="card-title mb-0">
+            <a href="/u/{{ post.user_id }}">{{ user_display(post.username) }}</a>
+          </h6>
+          <small class="text-muted">{{ post.created_at|datetimeformat }}</small>
+        </div>
+        <p class="mt-2 mb-0">
+          <a href="{{ url_for('post_detail', post_id=post.id) }}" class="text-decoration-none text-reset">{{ post.content }}</a>
+        </p>
+      </div>
+    </div>
+    {% endfor %}
+  {% else %}
+    <p class="text-center text-muted">No posts in this group yet.</p>
+  {% endif %}
+
+</div>
+
+{% endblock %}

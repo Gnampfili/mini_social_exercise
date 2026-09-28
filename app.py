@@ -1,8 +1,9 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, g
+from flask import Flask, render_template, request, redirect, url_for, session, flash, g, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 import collections
 import json
+import math
 import sqlite3
 import hashlib
 import re
@@ -26,6 +27,64 @@ MODERATION_CONFIG = json.loads(decrypted_data)
 TIER1_WORDS = MODERATION_CONFIG['categories']['tier1_severe_violations']['words']
 TIER2_PHRASES = MODERATION_CONFIG['categories']['tier2_spam_scams']['phrases']
 TIER3_WORDS = MODERATION_CONFIG['categories']['tier3_mild_profanity']['words']
+
+# ----- Groups feature -----
+# Roles are ordered from least to most privileged.
+GROUP_ROLES = ['member', 'moderator', 'admin']
+
+
+def init_group_tables():
+    """
+    One-time startup migration for the Groups feature. Creates the 'groups'
+    and 'group_members' tables if they don't exist yet, and adds a nullable
+    'group_id' column to 'posts' so a post can optionally belong to a group.
+    Safe to run every time the app starts (all operations are idempotent).
+    """
+    conn = sqlite3.connect(DATABASE)
+    cur = conn.cursor()
+
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT,
+            created_by INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+        )
+    ''')
+
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS group_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT 'member',
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+            UNIQUE(group_id, user_id)
+        )
+    ''')
+
+    # Add posts.group_id if it's missing (older databases won't have it yet).
+    cur.execute("PRAGMA table_info(posts)")
+    post_columns = [row[1] for row in cur.fetchall()]
+    if 'group_id' not in post_columns:
+        cur.execute('ALTER TABLE posts ADD COLUMN group_id INTEGER DEFAULT NULL')
+
+    conn.commit()
+    conn.close()
+
+
+init_group_tables()
+
+
+def get_group_role(user_id, group_id):
+    """Returns the caller's role ('admin'/'moderator'/'member') in a group, or None."""
+    if not user_id or not group_id:
+        return None
+    row = query_db('SELECT role FROM group_members WHERE group_id = ? AND user_id = ?',
+                    (group_id, user_id), one=True)
+    return row['role'] if row else None
+
 
 def get_db():
     """
@@ -124,9 +183,11 @@ def feed():
     if sort == 'popular':
         query = f"""
             SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
+                   p.group_id, gr.name as group_name,
                    IFNULL(r.total_reactions, 0) as total_reactions
             FROM posts p
             JOIN users u ON p.user_id = u.id
+            LEFT JOIN groups gr ON p.group_id = gr.id
             LEFT JOIN (
                 SELECT post_id, COUNT(*) as total_reactions FROM reactions GROUP BY post_id
             ) r ON p.id = r.post_id
@@ -140,9 +201,11 @@ def feed():
         posts = recommend(current_user_id, show == 'following' and current_user_id)
     else:  # Default sort is 'new'
         query = f"""
-            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
+                   p.group_id, gr.name as group_name
             FROM posts p
             JOIN users u ON p.user_id = u.id
+            LEFT JOIN groups gr ON p.group_id = gr.id
             {where_clause}
             ORDER BY p.created_at DESC
             LIMIT ? OFFSET ?
@@ -191,6 +254,17 @@ def feed():
             'comments': comments_moderated
         })
 
+    #  3.5 Groups the current user can post into (for the "create post" form) 
+    user_groups = []
+    if current_user_id:
+        user_groups = query_db('''
+            SELECT g.id, g.name
+            FROM groups g
+            JOIN group_members gm ON gm.group_id = g.id
+            WHERE gm.user_id = ?
+            ORDER BY g.name ASC
+        ''', (current_user_id,))
+
     #  4. Render Template with Pagination Info 
     return render_template('feed.html.j2', 
                            posts=posts_data, 
@@ -199,7 +273,8 @@ def feed():
                            page=page, # Pass current page number
                            per_page=POSTS_PER_PAGE, # Pass items per page
                            reaction_emojis=REACTION_EMOJIS,
-                           reaction_types=REACTION_TYPES)
+                           reaction_types=REACTION_TYPES,
+                           user_groups=user_groups)
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
@@ -214,14 +289,23 @@ def add_post():
     # Get content from the submitted form
     content = request.form.get('content')
 
+    # Optional: post into one of the groups the user belongs to
+    group_id = request.form.get('group_id') or None
+    if group_id:
+        is_member = query_db('SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?',
+                             (group_id, user_id), one=True)
+        if not is_member:
+            flash('You can only post to groups you are a member of.', 'danger')
+            return redirect(url_for('feed'))
+
     # Pass the user's content through the moderation function
     moderated_content = content
 
     # Basic validation to ensure post is not empty
     if moderated_content and moderated_content.strip():
         db = get_db()
-        db.execute('INSERT INTO posts (user_id, content) VALUES (?, ?)',
-                   (user_id, moderated_content))
+        db.execute('INSERT INTO posts (user_id, content, group_id) VALUES (?, ?, ?)',
+                   (user_id, moderated_content, group_id))
         db.commit()
         flash('Your post was successfully created!', 'success')
     else:
@@ -299,6 +383,15 @@ def user_profile(username):
     followers_count = query_db('SELECT COUNT(*) as cnt FROM follows WHERE followed_id = ?', (user['id'],), one=True)['cnt']
     following_count = query_db('SELECT COUNT(*) as cnt FROM follows WHERE follower_id = ?', (user['id'],), one=True)['cnt']
 
+    #  Groups this user belongs to (click through to see/join from there) 
+    user_groups = query_db('''
+        SELECT g.id, g.name, gm.role
+        FROM group_members gm
+        JOIN groups g ON gm.group_id = g.id
+        WHERE gm.user_id = ?
+        ORDER BY g.name ASC
+    ''', (user['id'],))
+
     #  NEW: CHECK FOLLOW STATUS 
     is_currently_following = False # Default to False
     current_user_id = session.get('user_id')
@@ -320,7 +413,8 @@ def user_profile(username):
                            comments=comments,
                            followers_count=followers_count, 
                            following_count=following_count,
-                           is_following=is_currently_following)
+                           is_following=is_currently_following,
+                           user_groups=user_groups)
     
 
 @app.route('/u/<username>/followers')
@@ -354,9 +448,11 @@ def post_detail(post_id):
     """Displays a single post and its comments, with content moderation applied."""
     
     post_raw = query_db('''
-        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
+               p.group_id, gr.name as group_name
         FROM posts p
         JOIN users u ON p.user_id = u.id
+        LEFT JOIN groups gr ON p.group_id = gr.id
         WHERE p.id = ?
     ''', (post_id,), one=True)
 
@@ -738,10 +834,13 @@ def admin_dashboard():
     posts = []
     for post in posts_raw:
         post_dict = dict(post)
+        # Rule 2.1, Step 1: calculate the post's base Content Score.
         _, base_score = moderate_content(post_dict['content'])
         final_score = base_score 
+        # Rule 2.1, Step 2: determine the author's account age in days.
         author_created_dt = post_dict['user_created_at']
         author_age_days = (datetime.utcnow() - author_created_dt).days
+        # Rule 2.1, Step 3: apply the new-account multiplier when applicable.
         if author_age_days < 7:
             final_score *= 1.5
         risk_label, risk_sort_key = get_risk_profile(final_score)
@@ -766,9 +865,12 @@ def admin_dashboard():
     comments = []
     for comment in comments_raw:
         comment_dict = dict(comment)
+        # Rule 2.1, Step 1: calculate the comment's base Content Score.
         _, score = moderate_content(comment_dict['content'])
+        # Rule 2.1, Step 2: determine the author's account age in days.
         author_created_dt = comment_dict['user_created_at']
         author_age_days = (datetime.utcnow() - author_created_dt).days
+        # Rule 2.1, Step 3: apply the new-account multiplier when applicable.
         if author_age_days < 7:
             score *= 1.5
         risk_label, risk_sort_key = get_risk_profile(score)
@@ -852,6 +954,236 @@ def admin_delete_comment(comment_id):
     flash(f'Comment {comment_id} has been deleted.', 'success')
     return redirect(url_for('admin_dashboard'))
 
+#  Groups 
+
+@app.route('/groups')
+def groups_list():
+    """Browse all groups. Logged-in users can also create a new one from here."""
+    current_user_id = session.get('user_id')
+
+    groups_raw = query_db('''
+        SELECT g.id, g.name, g.description, g.created_at, u.username as creator_username,
+               (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.id) as member_count
+        FROM groups g
+        JOIN users u ON g.created_by = u.id
+        ORDER BY g.created_at DESC
+    ''')
+
+    groups = []
+    for grp in groups_raw:
+        grp_dict = dict(grp)
+        grp_dict['my_role'] = get_group_role(current_user_id, grp_dict['id'])
+        groups.append(grp_dict)
+
+    return render_template('groups.html.j2', groups=groups)
+
+
+@app.route('/groups/new', methods=['POST'])
+def create_group():
+    """Creates a new group. The creator automatically becomes its admin."""
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to create a group.', 'danger')
+        return redirect(url_for('login'))
+
+    name = request.form.get('name', '').strip()
+    description = request.form.get('description', '').strip()
+
+    if not name:
+        flash('A group needs a name.', 'warning')
+        return redirect(url_for('groups_list'))
+
+    db = get_db()
+    try:
+        cur = db.execute('INSERT INTO groups (name, description, created_by) VALUES (?, ?, ?)',
+                          (name, description, user_id))
+        db.commit()
+        new_group_id = cur.lastrowid
+
+        # The creator is automatically the group's first admin.
+        db.execute('INSERT INTO group_members (group_id, user_id, role) VALUES (?, ?, ?)',
+                   (new_group_id, user_id, 'admin'))
+        db.commit()
+
+        flash(f'Group "{name}" was created!', 'success')
+        return redirect(url_for('group_detail', group_id=new_group_id))
+    except sqlite3.IntegrityError:
+        flash('A group with that name already exists.', 'danger')
+        return redirect(url_for('groups_list'))
+
+
+@app.route('/groups/<int:group_id>')
+def group_detail(group_id):
+    """Shows a group's info, its members grouped by role, and recent posts in it."""
+    group_raw = query_db('''
+        SELECT g.id, g.name, g.description, g.created_at, u.username as creator_username
+        FROM groups g
+        JOIN users u ON g.created_by = u.id
+        WHERE g.id = ?
+    ''', (group_id,), one=True)
+
+    if not group_raw:
+        abort(404)
+
+    group = dict(group_raw)
+    current_user_id = session.get('user_id')
+    my_role = get_group_role(current_user_id, group_id)
+
+    members_raw = query_db('''
+        SELECT u.id as user_id, u.username, gm.role, gm.joined_at
+        FROM group_members gm
+        JOIN users u ON gm.user_id = u.id
+        WHERE gm.group_id = ?
+        ORDER BY CASE gm.role WHEN 'admin' THEN 0 WHEN 'moderator' THEN 1 ELSE 2 END, gm.joined_at ASC
+    ''', (group_id,))
+    members = [dict(m) for m in members_raw]
+
+    posts_raw = query_db('''
+        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+        WHERE p.group_id = ?
+        ORDER BY p.created_at DESC
+        LIMIT 20
+    ''', (group_id,))
+    posts = []
+    for post in posts_raw:
+        post_dict = dict(post)
+        post_dict['content'], _ = moderate_content(post_dict['content'])
+        posts.append(post_dict)
+
+    return render_template('group_detail.html.j2',
+                           group=group,
+                           members=members,
+                           my_role=my_role,
+                           posts=posts,
+                           group_roles=GROUP_ROLES)
+
+
+@app.route('/groups/<int:group_id>/join', methods=['POST'])
+def join_group(group_id):
+    """Lets the current user join a group as a regular member."""
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to join a group.', 'danger')
+        return redirect(url_for('login'))
+
+    group = query_db('SELECT id, name FROM groups WHERE id = ?', (group_id,), one=True)
+    if not group:
+        flash('Group not found.', 'danger')
+        return redirect(url_for('groups_list'))
+
+    db = get_db()
+    try:
+        db.execute('INSERT INTO group_members (group_id, user_id, role) VALUES (?, ?, ?)',
+                   (group_id, user_id, 'member'))
+        db.commit()
+        flash(f'You joined "{group["name"]}".', 'success')
+    except sqlite3.IntegrityError:
+        flash('You are already a member of this group.', 'info')
+
+    return redirect(url_for('group_detail', group_id=group_id))
+
+
+@app.route('/groups/<int:group_id>/leave', methods=['POST'])
+def leave_group(group_id):
+    """Lets the current user leave a group (unless they're its last admin)."""
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to leave a group.', 'danger')
+        return redirect(url_for('login'))
+
+    role = get_group_role(user_id, group_id)
+    if not role:
+        flash('You are not a member of this group.', 'info')
+        return redirect(url_for('group_detail', group_id=group_id))
+
+    if role == 'admin':
+        remaining_admins = query_db(
+            "SELECT COUNT(*) as cnt FROM group_members WHERE group_id = ? AND role = 'admin' AND user_id != ?",
+            (group_id, user_id), one=True)['cnt']
+        if remaining_admins == 0:
+            flash('You are the only admin left. Promote someone else to admin before leaving.', 'warning')
+            return redirect(url_for('group_detail', group_id=group_id))
+
+    db = get_db()
+    db.execute('DELETE FROM group_members WHERE group_id = ? AND user_id = ?', (group_id, user_id))
+    db.commit()
+    flash('You left the group.', 'info')
+    return redirect(url_for('group_detail', group_id=group_id))
+
+
+@app.route('/groups/<int:group_id>/members/<int:member_user_id>/role', methods=['POST'])
+def change_group_role(group_id, member_user_id):
+    """Admin-only: change a member's role between member, moderator and admin."""
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to do that.', 'danger')
+        return redirect(url_for('login'))
+
+    acting_role = get_group_role(user_id, group_id)
+    if acting_role != 'admin':
+        flash('Only group admins can change member roles.', 'danger')
+        return redirect(url_for('group_detail', group_id=group_id))
+
+    new_role = request.form.get('role')
+    if new_role not in GROUP_ROLES:
+        flash('Invalid role.', 'warning')
+        return redirect(url_for('group_detail', group_id=group_id))
+
+    target_role = get_group_role(member_user_id, group_id)
+    if not target_role:
+        flash('That user is not a member of this group.', 'danger')
+        return redirect(url_for('group_detail', group_id=group_id))
+
+    # Don't let the only admin demote themselves without promoting someone else first.
+    if member_user_id == user_id and target_role == 'admin' and new_role != 'admin':
+        remaining_admins = query_db(
+            "SELECT COUNT(*) as cnt FROM group_members WHERE group_id = ? AND role = 'admin' AND user_id != ?",
+            (group_id, user_id), one=True)['cnt']
+        if remaining_admins == 0:
+            flash('You are the only admin left. Promote someone else first.', 'warning')
+            return redirect(url_for('group_detail', group_id=group_id))
+
+    db = get_db()
+    db.execute('UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?',
+               (new_role, group_id, member_user_id))
+    db.commit()
+    flash('Member role updated.', 'success')
+    return redirect(url_for('group_detail', group_id=group_id))
+
+
+@app.route('/groups/<int:group_id>/members/<int:member_user_id>/remove', methods=['POST'])
+def remove_group_member(group_id, member_user_id):
+    """Admins can remove any member; moderators can only remove regular members."""
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to do that.', 'danger')
+        return redirect(url_for('login'))
+
+    acting_role = get_group_role(user_id, group_id)
+    target_role = get_group_role(member_user_id, group_id)
+
+    if not target_role:
+        flash('That user is not a member of this group.', 'danger')
+        return redirect(url_for('group_detail', group_id=group_id))
+
+    can_remove = (
+        (acting_role == 'admin' and member_user_id != user_id)
+        or (acting_role == 'moderator' and target_role == 'member')
+    )
+
+    if not can_remove:
+        flash('You do not have permission to remove this member.', 'danger')
+        return redirect(url_for('group_detail', group_id=group_id))
+
+    db = get_db()
+    db.execute('DELETE FROM group_members WHERE group_id = ? AND user_id = ?', (group_id, member_user_id))
+    db.commit()
+    flash('Member removed from the group.', 'success')
+    return redirect(url_for('group_detail', group_id=group_id))
+
+
 @app.route('/rules')
 def rules():
     return render_template('rules.html.j2')
@@ -883,10 +1215,45 @@ def user_risk_analysis(user_id):
             password: admin
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
-    
-    score = 0
 
-    return score;
+    user = query_db(
+        'SELECT profile, created_at FROM users WHERE id = ?',
+        (user_id,),
+        one=True
+    )
+    if user is None:
+        return 0.0
+
+    # Rule 2.2, Step 1: calculate the user's profile Content Score.
+    posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+
+    _, profile_score = moderate_content(user['profile'] or '')
+
+    # Rule 2.2, Steps 2-3: calculate post and comment Content Scores.
+    post_scores = [moderate_content(row['content'])[1] for row in posts]
+    comment_scores = [moderate_content(row['content'])[1] for row in comments]
+
+    # Rule 2.2, Steps 2-3: average each content type, using zero when absent.
+    average_post_score = sum(post_scores) / len(post_scores) if post_scores else 0.0
+    average_comment_score = sum(comment_scores) / len(comment_scores) if comment_scores else 0.0
+
+    # Rule 2.2, Step 4: combine profile, post, and comment scores with weights.
+    content_risk_score = (
+        profile_score
+        + (average_post_score * 3.0)
+        + average_comment_score
+    )
+
+    # Rule 2.2, Step 5: determine the account age and apply its multiplier.
+    account_age_days = (datetime.utcnow() - user['created_at']).days
+    if account_age_days < 7:
+        content_risk_score *= 1.5
+    elif account_age_days < 30:
+        content_risk_score *= 1.2
+
+    # Rule 2.2, Step 6: cap the final user risk score at 5.0.
+    return min(5.0, content_risk_score)
 
     
 # Assignment 2.1
@@ -908,12 +1275,95 @@ def moderate_content(content):
     """
 
     moderated_content = content
-    score = 0
+    score = 0.0
+
+    if not moderated_content:
+        return moderated_content, score
+    #Rule 1.1.1
+    # Tier 1: severe violations. Heavily penalized, and fully censored.
+    for word in TIER1_WORDS:
+        pattern = re.compile(r'\b' + re.escape(word) + r'\b', re.IGNORECASE)
+        matches = pattern.findall(moderated_content)
+        if matches:
+            score = 5.0
+            moderated_content = "[content removed due to severe violation]"
+            
+            print("word was tier 1 sensored")
+            return moderated_content, score
+    #Rule 1.1.2
+    # Tier 2: spam/scam phrases. 
+    for phrase in TIER2_PHRASES:
+        pattern = re.compile(re.escape(phrase), re.IGNORECASE)
+        matches = pattern.findall(moderated_content)
+        if matches:
+            score = 5.0
+            moderated_content = "[content removed due to spam/scam policy]"
+            print("tier 2 phrase was sensored")
+            return moderated_content, score
+    #Rule 1.2.1
+    #if 1.1 is passed we go to 1.2
+    for word in TIER3_WORDS:
+        pattern = re.compile(r'\b' + re.escape(word) + r'\b', re.IGNORECASE)
+        matches = pattern.findall(moderated_content)
+        if matches:
+            score += 2.0 * len(matches)
+            moderated_content = pattern.sub(
+                lambda m: '*' * len(m.group(0)),
+                moderated_content
+            )
+            print("tier 3 word was sensored")
+
+    # Rule 1.2.2
+    url_pattern = re.compile(r'\b(?:https?://|www\.)[^\s<>"\']+', re.IGNORECASE)
+    url_matches = url_pattern.findall(moderated_content)
+    if url_matches:
+        score += 2.0 * len(url_matches)
+        moderated_content = url_pattern.sub('[link removed]', moderated_content)
+
+    # Rule 1.2.3
+    alphabetic_characters = [character for character in moderated_content if character.isalpha()]
+    uppercase_characters = [character for character in alphabetic_characters if character.isupper()]
+    if (len(alphabetic_characters) > 15 and
+            len(uppercase_characters) / len(alphabetic_characters) > 0.70):
+        score += 0.5
+        
     
     return moderated_content, score
 
 # Coding Assignment #3
 # Assignment 3.1
+
+# Common English words (plus common social-media filler/sentiment words) that
+# carry little topical signal, so they're excluded when building/matching
+# interest profiles for recommendations.
+STOPWORDS = {
+    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'and', 'or', 'but', 'to', 'of',
+    'in', 'on', 'for', 'with', 'this', 'that', 'these', 'those', 'it', 'its',
+    'i', 'you', 'we', 'my', 'your', 'our', 'their', 'they', 'he', 'she', 'his',
+    'her', 'them', 'us', 'am', 'been', 'being', 'at', 'be', 'as', 'so', 'if',
+    'me', 'im', 'just', 'not', 'have', 'has', 'had', 'do', 'did', 'does', 'from',
+    'by', 'about', 'up', 'out', 'all', 'can', 'will', 'would', 'could', 'should',
+    'here', 'there', 'now', 'when', 'while', 'after', 'before', 'still', 'even',
+    'some', 'other', 'because', 'into', 'over', 'back', 'down', 'off', 'again',
+    'never', 'always', 'every', 'one', 'two', 'first', 'next', 'new', 'got', 'get',
+    'getting', 'went', 'going', 'come', 'came', 'made', 'make', 'making', 'start',
+    'started', 'starting', 'end', 'little', 'small', 'big', 'lot', 'bit', 'more',
+    'most', 'than', 'too', 'very', 'like', 'love', 'loved', 'really', 'super',
+    'good', 'great', 'best', 'worth', 'amazing', 'awesome', 'nice', 'happy',
+    'excited', 'feel', 'feeling', 'feels', 'today', 'day', 'time', 'life',
+    'people', 'thing', 'things', 'know', 'think', 'want', 'need', 'finally',
+    'finished',
+}
+
+
+def _tokenize(text):
+    """Lowercases text and splits it into simple word tokens, dropping stopwords/short words."""
+    if not text:
+        return []
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    return [w for w in words if len(w) > 2 and w not in STOPWORDS]
+
+
 def recommend(user_id, filter_following):
     """
     Args:
@@ -934,10 +1384,120 @@ def recommend(user_id, filter_following):
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
 
-    recommended_posts = {} 
+    # A content-based recommender: build a TF-IDF-weighted bag-of-words profile
+    # of the topics the user has shown interest in (posts they reacted to or
+    # commented on), then rank other posts by how much they overlap with it.
+    # Words that show up in almost every post (like "finished" or "project")
+    # get down-weighted by IDF, so distinctive topic words (like "diy") drive
+    # the ranking instead.
 
-    return recommended_posts;
+    fallback_query = """
+        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
+               p.group_id, gr.name as group_name
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+        LEFT JOIN groups gr ON p.group_id = gr.id
+        ORDER BY p.created_at DESC
+        LIMIT 5
+    """
+
+    # Logged-out users have no engagement history to build a profile from.
+    if not user_id:
+        return query_db(fallback_query)
+
+    #  1. Find the posts the user engaged with (reacted to or commented on) 
+    engaged_posts = query_db('''
+        SELECT DISTINCT p.id, p.content
+        FROM posts p
+        WHERE p.id IN (SELECT post_id FROM reactions WHERE user_id = ?)
+           OR p.id IN (SELECT post_id FROM comments WHERE user_id = ?)
+    ''', (user_id, user_id))
+
+    if not engaged_posts:
+        # No engagement history yet -> nothing to personalize on.
+        return query_db(fallback_query)
+
+    engaged_post_ids = {row['id'] for row in engaged_posts}
+
+    #  2. Build the pool of candidate posts (posts we could recommend) 
+    where_clauses = ["p.user_id != ?"]
+    params = [user_id]
+
+    if filter_following:
+        where_clauses.append(
+            "p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
+        )
+        params.append(user_id)
+
+    candidate_query = f"""
+        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
+               p.group_id, gr.name as group_name
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+        LEFT JOIN groups gr ON p.group_id = gr.id
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY p.created_at DESC
+        LIMIT 200
+    """
+    candidates = query_db(candidate_query, params)
+
+    if not candidates:
+        return query_db(fallback_query)
+
+    #  3. Compute IDF (inverse document frequency) over engaged + candidate posts 
+    # so common words are worth less and distinctive/topic words are worth more.
+    corpus_token_sets = [set(_tokenize(row['content'])) for row in engaged_posts]
+    corpus_token_sets += [set(_tokenize(row['content'])) for row in candidates]
+
+    doc_frequency = collections.Counter()
+    for token_set in corpus_token_sets:
+        doc_frequency.update(token_set)
+
+    num_docs = len(corpus_token_sets)
+
+    def idf(word):
+        return math.log((num_docs + 1) / (doc_frequency.get(word, 0) + 1)) + 1.0
+
+    #  4. Build the user's interest profile 
+    # Words that recur across several of the posts the user engaged with are a
+    # much stronger interest signal than a word that only appears once, so the
+    # profile is weighted by (how many liked posts contain the word) * idf,
+    # rather than raw term frequency.
+    engaged_doc_frequency = collections.Counter()
+    for row in engaged_posts:
+        engaged_doc_frequency.update(set(_tokenize(row['content'])))
+
+    interest_profile = collections.Counter()
+    for word, freq_in_engaged in engaged_doc_frequency.items():
+        interest_profile[word] = freq_in_engaged * idf(word)
+
+    if not interest_profile:
+        return query_db(fallback_query)
+
+    #  5. Score each candidate by how much it overlaps with the interest profile 
+    scored = []
+    for post in candidates:
+        if post['id'] in engaged_post_ids:
+            continue  # Already seen/engaged with, don't recommend it again.
+        tokens = set(_tokenize(post['content']))
+        if not tokens:
+            continue
+        overlap_score = sum(interest_profile.get(tok, 0.0) for tok in tokens)
+        if overlap_score > 0:
+            scored.append((overlap_score, post))
+
+    if not scored:
+        return query_db(fallback_query)
+
+    #  6. Take the 5 most relevant, then present them newest-first 
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    top_posts = [post for _, post in scored[:5]]
+    top_posts.sort(key=lambda post: post['created_at'], reverse=True)
+
+    return top_posts
+
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)
+
 
