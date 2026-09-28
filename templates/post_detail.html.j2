@@ -1,6 +1,7 @@
 {% extends "base.html.j2" %}
 {% block content %}
 {% from "macros/user_macros.html.j2" import user_display %}
+{% from "macros/appeal_macros.html.j2" import appeal_widget %}
 
 <div class="col-md-8 mx-auto pt-4">
   <div class="card shadow-sm">
@@ -26,7 +27,8 @@
         {% endif %}
       </div>
       
-      <p class="card-text mt-2">{{ post.content }}</p>
+      <p class="card-text mt-2 mb-1">{{ post.content }}</p>
+      {{ appeal_widget(post.appeal) }}
 
       <!-- Reactions Display and Add Reaction Button (Copied from feed.html.j2) -->
       <div class="d-flex align-items-center mt-2 mb-2">
@@ -87,6 +89,7 @@
             <div>
               <strong><a href="/u/{{ comment.username }}">{{ user_display(comment.username) }}</a></strong>
               <p class="mb-0">{{ comment.content }}</p>
+              {{ appeal_widget(comment.appeal) }}
               
             
             {% if session.get('user_id') == comment.user_id or session.get('user_id') == post.user_id %}

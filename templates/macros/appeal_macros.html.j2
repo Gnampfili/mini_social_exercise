@@ -1,0 +1,16 @@
+{# Shows an "Appeal" button or the status of an appeal. Only the author of moderated content gets an `appeal` dict. #}
+{% macro appeal_widget(appeal) %}
+{% if appeal %}
+  {% if appeal.status == 'none' %}
+    <a href="{{ appeal.url }}" class="badge bg-warning text-dark text-decoration-none">Appeal moderation</a>
+  {% elif appeal.status == 'pending' %}
+    <span class="badge bg-secondary">Appeal pending</span>
+  {% elif appeal.status == 'declined' %}
+    <span class="badge bg-danger">Appeal declined</span>
+    {% if appeal.response %}<small class="text-muted d-block">Admin: {{ appeal.response }}</small>{% endif %}
+  {% elif appeal.status == 'accepted' %}
+    <span class="badge bg-success">Restored after appeal</span>
+    {% if appeal.response %}<small class="text-muted d-block">Admin: {{ appeal.response }}</small>{% endif %}
+  {% endif %}
+{% endif %}
+{% endmacro %}

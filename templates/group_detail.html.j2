@@ -1,6 +1,7 @@
 {% extends "base.html.j2" %}
 {% block content %}
 {% from "macros/user_macros.html.j2" import user_display %}
+{% from "macros/appeal_macros.html.j2" import appeal_widget %}
 
 <div class="col-md-8 mx-auto">
 
@@ -100,6 +101,7 @@
         <p class="mt-2 mb-0">
           <a href="{{ url_for('post_detail', post_id=post.id) }}" class="text-decoration-none text-reset">{{ post.content }}</a>
         </p>
+        {{ appeal_widget(post.appeal) }}
       </div>
     </div>
     {% endfor %}

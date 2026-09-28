@@ -1,0 +1,62 @@
+{% extends "base.html.j2" %}
+{% block content %}
+
+{% macro appeal_card(a, resolvable) %}
+<div class="card shadow-sm mb-3">
+  <div class="card-body">
+    <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
+      <div>
+        <span class="badge bg-info text-dark">{{ a.target_type }}</span>
+        by <a href="/u/{{ a.username }}">{{ a.username }}</a>
+        <small class="text-muted">&middot; submitted {{ a.created_at|datetimeformat }}</small>
+      </div>
+      {% if a.status == 'accepted' %}<span class="badge bg-success">Accepted</span>
+      {% elif a.status == 'declined' %}<span class="badge bg-danger">Declined</span>
+      {% else %}<span class="badge bg-secondary">Pending</span>{% endif %}
+    </div>
+
+    {% if a.original is none %}
+      <p class="text-muted mt-3 mb-0"><em>The content was deleted in the meantime.</em></p>
+    {% else %}
+      <div class="row mt-3">
+        <div class="col-md-6">
+          <h6 class="text-muted">Original text</h6>
+          <p style="white-space: pre-wrap;">{{ a.original }}</p>
+        </div>
+        <div class="col-md-6">
+          <h6 class="text-muted">Shown after moderation (score {{ a.score|round(2) }})</h6>
+          <p style="white-space: pre-wrap;">{{ a.moderated }}</p>
+        </div>
+      </div>
+      <a href="{{ a.link }}" class="small">View in context</a>
+    {% endif %}
+
+    <h6 class="text-muted mt-3">User's appeal</h6>
+    <p class="mb-2" style="white-space: pre-wrap;">{{ a.message }}</p>
+
+    {% if resolvable %}
+      <form action="{{ url_for('admin_resolve_appeal', appeal_id=a.id) }}" method="POST">
+        <input type="text" class="form-control mb-2" name="admin_response" maxlength="1000" placeholder="Optional reply to the user">
+        <button type="submit" name="decision" value="accept" class="btn btn-success">Accept (undo moderation)</button>
+        <button type="submit" name="decision" value="decline" class="btn btn-danger">Decline</button>
+      </form>
+    {% else %}
+      <small class="text-muted">Resolved {{ a.resolved_at|datetimeformat }}{% if a.admin_response %} &middot; Admin reply: {{ a.admin_response }}{% endif %}</small>
+    {% endif %}
+  </div>
+</div>
+{% endmacro %}
+
+<div class="col-md-10 mx-auto">
+  <h1 class="mb-4">Moderation Appeals</h1>
+
+  <h4 class="border-bottom pb-2 mb-3">Pending ({{ pending|length }})</h4>
+  {% for a in pending %}{{ appeal_card(a, true) }}
+  {% else %}<p class="text-muted">No pending appeals.</p>{% endfor %}
+
+  <h4 class="border-bottom pb-2 mb-3 mt-5">Resolved ({{ resolved|length }})</h4>
+  {% for a in resolved %}{{ appeal_card(a, false) }}
+  {% else %}<p class="text-muted">No resolved appeals yet.</p>{% endfor %}
+</div>
+
+{% endblock %}

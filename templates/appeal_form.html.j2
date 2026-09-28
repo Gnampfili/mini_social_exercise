@@ -1,0 +1,33 @@
+{% extends "base.html.j2" %}
+{% block content %}
+
+<div class="col-md-8 mx-auto">
+  <h2 class="text-center border-bottom pb-2 mb-4"><span>Appeal a moderation decision</span></h2>
+
+  <div class="card shadow-sm mb-4">
+    <div class="card-body">
+      <h6 class="text-muted">Your original text ({{ target_type }})</h6>
+      <p class="mb-3" style="white-space: pre-wrap;">{{ original }}</p>
+      <h6 class="text-muted">What other users currently see</h6>
+      <p class="mb-2" style="white-space: pre-wrap;">{{ moderated }}</p>
+      <small class="text-muted">Content score: {{ score }}</small>
+    </div>
+  </div>
+
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <h5 class="card-title">Why should this not be moderated?</h5>
+      <p class="text-muted small">An admin will review your message and either accept the appeal (the moderation is undone) or decline it. You can appeal each decision once.</p>
+      <form method="POST">
+        <input type="hidden" name="next" value="{{ next_url }}">
+        <div class="mb-3">
+          <textarea class="form-control" name="message" rows="5" maxlength="{{ max_length }}" required placeholder="Explain your case..."></textarea>
+        </div>
+        <a href="{{ next_url }}" class="btn btn-secondary">Cancel</a>
+        <button type="submit" class="btn btn-primary float-end">Submit appeal</button>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

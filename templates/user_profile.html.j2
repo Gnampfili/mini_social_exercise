@@ -1,6 +1,7 @@
 {% extends "base.html.j2" %}
 {% block content %}
 {% from "macros/user_macros.html.j2" import user_display%}
+{% from "macros/appeal_macros.html.j2" import appeal_widget %}
 
 <div class="container mt-5">
 
@@ -15,7 +16,8 @@
             <strong>Birthdate:</strong> {{ user.birthdate or "N/A" }}<br>
             <strong>Joined:</strong> {{ user.created_at|datetimeformat }}
           </p>
-          <p class="card-text">{{ user.profile or "No profile information provided." }}</p>
+          <p class="card-text mb-1">{{ user.profile or "No profile information provided." }}</p>
+          {{ appeal_widget(user.appeal) }}
 
          {% if session.user_id and session.user_id != user.id %}
             <div class="my-3">
@@ -75,6 +77,7 @@
             <small class="text-muted">Posted on {{ post.created_at|datetimeformat }}</small>
           </div>
         </a>
+        {% if post.appeal %}<div class="card-footer bg-transparent">{{ appeal_widget(post.appeal) }}</div>{% endif %}
       </div>
     </div>
     {% else %}
@@ -100,6 +103,7 @@
             <small class="text-muted">Commented on {{ comment.created_at|datetimeformat }}</small>
           </div>
         </a>
+        {% if comment.appeal %}<div class="card-footer bg-transparent">{{ appeal_widget(comment.appeal) }}</div>{% endif %}
       </div>
     </div>
     {% else %}

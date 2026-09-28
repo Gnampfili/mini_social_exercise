@@ -77,6 +77,36 @@ def init_group_tables():
 init_group_tables()
 
 
+def init_appeal_tables():
+    """
+    Startup migration for the moderation-appeal feature. One appeal is allowed
+    per piece of content (UNIQUE on target_type + target_id).
+    target_type is 'post', 'comment' or 'profile' (for profile, target_id is the user id).
+    status is 'pending', 'accepted' or 'declined'.
+    """
+    conn = sqlite3.connect(DATABASE)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS appeals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_type TEXT NOT NULL,
+            target_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            admin_response TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+            resolved_at TIMESTAMP,
+            resolved_by INTEGER,
+            UNIQUE(target_type, target_id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
+init_appeal_tables()
+
+
 def get_group_role(user_id, group_id):
     """Returns the caller's role ('admin'/'moderator'/'member') in a group, or None."""
     if not user_id or not group_id:
@@ -146,6 +176,76 @@ def datetimeformat(value):
     else:
         return "N/A"
     return dt.strftime('%b %d, %Y %H:%M')
+
+#  Moderation appeals: helpers 
+APPEAL_TARGET_TYPES = ('post', 'comment', 'profile')
+APPEAL_MAX_LENGTH = 1000
+
+
+def apply_moderation(item, target_type, target_id, author_id, key='content'):
+    """
+    Moderates item[key] in place for display. If the content was altered:
+      - an ACCEPTED appeal undoes the moderation (everyone sees the original text);
+      - the author additionally gets item['appeal'] describing the appeal state,
+        which the templates use to show an "Appeal" button / status badge.
+    """
+    raw = item.get(key)
+    if not raw:
+        return item
+
+    moderated, _ = moderate_content(raw)
+    if moderated == raw:
+        return item  # nothing was moderated, nothing to appeal
+
+    appeal = query_db(
+        'SELECT status, admin_response FROM appeals WHERE target_type = ? AND target_id = ?',
+        (target_type, target_id), one=True)
+    status = appeal['status'] if appeal else 'none'
+
+    if status == 'accepted':
+        moderated = raw  # moderation undone
+
+    item[key] = moderated
+
+    viewer_id = session.get('user_id')
+    if viewer_id and viewer_id == author_id:
+        item['appeal'] = {
+            'status': status,
+            'response': appeal['admin_response'] if appeal else None,
+            'url': url_for('appeal_content', target_type=target_type, target_id=target_id,
+                           next=request.path),
+        }
+    return item
+
+
+def get_appeal_target(target_type, target_id):
+    """Loads the raw content an appeal refers to (or None if it no longer exists)."""
+    if target_type == 'post':
+        row = query_db('SELECT id, content, user_id FROM posts WHERE id = ?', (target_id,), one=True)
+    elif target_type == 'comment':
+        row = query_db('SELECT id, content, user_id, post_id FROM comments WHERE id = ?', (target_id,), one=True)
+    elif target_type == 'profile':
+        row = query_db('SELECT id, profile AS content, id AS user_id FROM users WHERE id = ?', (target_id,), one=True)
+    else:
+        return None
+    return dict(row) if row else None
+
+
+def safe_next_url(candidate):
+    """Only allow redirects to local paths."""
+    if candidate and candidate.startswith('/') and not candidate.startswith('//') and '\\' not in candidate:
+        return candidate
+    return url_for('feed')
+
+
+@app.context_processor
+def inject_pending_appeals():
+    """Gives the navbar the number of open appeals (admin only)."""
+    if session.get('username') == 'admin':
+        row = query_db("SELECT COUNT(*) AS cnt FROM appeals WHERE status = 'pending'", one=True)
+        return {'pending_appeals_count': row['cnt'] if row else 0}
+    return {}
+
 
 REACTION_EMOJIS = {
     'like': '❤️', 'love': '😍', 'laugh': '😂',
@@ -240,11 +340,11 @@ def feed():
         reactions = query_db('SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type', (post['id'],))
         comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],))
         post_dict = dict(post)
-        post_dict['content'], _ = moderate_content(post_dict['content'])
+        apply_moderation(post_dict, 'post', post_dict['id'], post_dict['user_id'])
         comments_moderated = []
         for comment in comments_raw:
             comment_dict = dict(comment)
-            comment_dict['content'], _ = moderate_content(comment_dict['content'])
+            apply_moderation(comment_dict, 'comment', comment_dict['id'], comment_dict['user_id'])
             comments_moderated.append(comment_dict)
         posts_data.append({
             'post': post_dict,
@@ -361,23 +461,20 @@ def user_profile(username):
         abort(404)
 
     user = dict(user_raw)
-    moderated_bio, _ = moderate_content(user.get('profile', ''))
-    user['profile'] = moderated_bio
+    apply_moderation(user, 'profile', user['id'], user['id'], key='profile')
 
     posts_raw = query_db('SELECT id, content, user_id, created_at FROM posts WHERE user_id = ? ORDER BY created_at DESC', (user['id'],))
     posts = []
     for post_raw in posts_raw:
         post = dict(post_raw)
-        moderated_post_content, _ = moderate_content(post['content'])
-        post['content'] = moderated_post_content
+        apply_moderation(post, 'post', post['id'], post['user_id'])
         posts.append(post)
 
     comments_raw = query_db('SELECT id, content, user_id, post_id, created_at FROM comments WHERE user_id = ? ORDER BY created_at DESC LIMIT 100', (user['id'],))
     comments = []
     for comment_raw in comments_raw:
         comment = dict(comment_raw)
-        moderated_comment_content, _ = moderate_content(comment['content'])
-        comment['content'] = moderated_comment_content
+        apply_moderation(comment, 'comment', comment['id'], comment['user_id'])
         comments.append(comment)
 
     followers_count = query_db('SELECT COUNT(*) as cnt FROM follows WHERE followed_id = ?', (user['id'],), one=True)['cnt']
@@ -464,8 +561,7 @@ def post_detail(post_id):
     # Convert the raw database row to a mutable dictionary
     post = dict(post_raw)
     # Unpack the tuple from moderate_content, we only need the moderated content string here
-    moderated_post_content, _ = moderate_content(post['content'])
-    post['content'] = moderated_post_content
+    apply_moderation(post, 'post', post['id'], post['user_id'])
 
     #  Fetch Reactions (No moderation needed) 
     reactions = query_db('''
@@ -483,8 +579,7 @@ def post_detail(post_id):
         comment = dict(comment_raw) # Convert to a dictionary
         # Moderate the content of each comment
         print(comment['content'])
-        moderated_comment_content, _ = moderate_content(comment['content'])
-        comment['content'] = moderated_comment_content
+        apply_moderation(comment, 'comment', comment['id'], comment['user_id'])
         comments.append(comment)
 
     # Pass the moderated data to the template
@@ -834,13 +929,10 @@ def admin_dashboard():
     posts = []
     for post in posts_raw:
         post_dict = dict(post)
-        # Rule 2.1, Step 1: calculate the post's base Content Score.
         _, base_score = moderate_content(post_dict['content'])
         final_score = base_score 
-        # Rule 2.1, Step 2: determine the author's account age in days.
         author_created_dt = post_dict['user_created_at']
         author_age_days = (datetime.utcnow() - author_created_dt).days
-        # Rule 2.1, Step 3: apply the new-account multiplier when applicable.
         if author_age_days < 7:
             final_score *= 1.5
         risk_label, risk_sort_key = get_risk_profile(final_score)
@@ -865,12 +957,9 @@ def admin_dashboard():
     comments = []
     for comment in comments_raw:
         comment_dict = dict(comment)
-        # Rule 2.1, Step 1: calculate the comment's base Content Score.
         _, score = moderate_content(comment_dict['content'])
-        # Rule 2.1, Step 2: determine the author's account age in days.
         author_created_dt = comment_dict['user_created_at']
         author_age_days = (datetime.utcnow() - author_created_dt).days
-        # Rule 2.1, Step 3: apply the new-account multiplier when applicable.
         if author_age_days < 7:
             score *= 1.5
         risk_label, risk_sort_key = get_risk_profile(score)
@@ -1049,7 +1138,7 @@ def group_detail(group_id):
     posts = []
     for post in posts_raw:
         post_dict = dict(post)
-        post_dict['content'], _ = moderate_content(post_dict['content'])
+        apply_moderation(post_dict, 'post', post_dict['id'], post_dict['user_id'])
         posts.append(post_dict)
 
     return render_template('group_detail.html.j2',
@@ -1182,6 +1271,135 @@ def remove_group_member(group_id, member_user_id):
     db.commit()
     flash('Member removed from the group.', 'success')
     return redirect(url_for('group_detail', group_id=group_id))
+
+
+#  Moderation appeals 
+
+@app.route('/appeals/new/<target_type>/<int:target_id>', methods=['GET', 'POST'])
+def appeal_content(target_type, target_id):
+    """Lets the author of moderated content argue why the moderation should be undone."""
+    if target_type not in APPEAL_TARGET_TYPES:
+        abort(404)
+
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to appeal a moderation decision.', 'danger')
+        return redirect(url_for('login'))
+
+    target = get_appeal_target(target_type, target_id)
+    if not target:
+        abort(404)
+
+    next_url = safe_next_url(request.values.get('next'))
+
+    if target['user_id'] != user_id:
+        flash('You can only appeal moderation of your own content.', 'danger')
+        return redirect(next_url)
+
+    moderated, score = moderate_content(target['content'])
+    if not target['content'] or moderated == target['content']:
+        flash('This content was not moderated, so there is nothing to appeal.', 'info')
+        return redirect(next_url)
+
+    existing = query_db('SELECT status FROM appeals WHERE target_type = ? AND target_id = ?',
+                        (target_type, target_id), one=True)
+    if existing:
+        flash(f'You have already appealed this decision (status: {existing["status"]}).', 'info')
+        return redirect(next_url)
+
+    if request.method == 'POST':
+        message = request.form.get('message', '').strip()
+        if not message:
+            flash('Please explain why this content should not be moderated.', 'warning')
+        elif len(message) > APPEAL_MAX_LENGTH:
+            flash(f'Your appeal is too long (max {APPEAL_MAX_LENGTH} characters).', 'warning')
+        else:
+            db = get_db()
+            try:
+                db.execute('INSERT INTO appeals (target_type, target_id, user_id, message) VALUES (?, ?, ?, ?)',
+                           (target_type, target_id, user_id, message))
+                db.commit()
+                flash('Your appeal was submitted. An admin will review it.', 'success')
+            except sqlite3.IntegrityError:
+                flash('You have already appealed this decision.', 'info')
+            return redirect(next_url)
+
+    return render_template('appeal_form.html.j2',
+                           target_type=target_type,
+                           target_id=target_id,
+                           original=target['content'],
+                           moderated=moderated,
+                           score=round(score, 2),
+                           max_length=APPEAL_MAX_LENGTH,
+                           next_url=next_url)
+
+
+@app.route('/admin/appeals')
+def admin_appeals():
+    """Admin-only list of all appeals; pending ones first."""
+    if session.get('username') != 'admin':
+        flash('You do not have permission to view this page.', 'danger')
+        return redirect(url_for('feed'))
+
+    rows = query_db('''
+        SELECT a.id, a.target_type, a.target_id, a.message, a.status, a.admin_response,
+               a.created_at, a.resolved_at, u.username
+        FROM appeals a
+        JOIN users u ON a.user_id = u.id
+        ORDER BY CASE a.status WHEN 'pending' THEN 0 ELSE 1 END,
+                 COALESCE(a.resolved_at, a.created_at) DESC
+    ''')
+
+    pending, resolved = [], []
+    for row in rows:
+        appeal = dict(row)
+        target = get_appeal_target(appeal['target_type'], appeal['target_id'])
+        if target:
+            appeal['original'] = target['content']
+            appeal['moderated'], appeal['score'] = moderate_content(target['content'])
+            if appeal['target_type'] == 'profile':
+                appeal['link'] = url_for('user_profile', username=appeal['username'])
+            elif appeal['target_type'] == 'comment':
+                appeal['link'] = url_for('post_detail', post_id=target['post_id'])
+            else:
+                appeal['link'] = url_for('post_detail', post_id=target['id'])
+        else:
+            appeal['original'] = None  # content was deleted meanwhile
+        (pending if appeal['status'] == 'pending' else resolved).append(appeal)
+
+    return render_template('admin_appeals.html.j2', pending=pending, resolved=resolved)
+
+
+@app.route('/admin/appeals/<int:appeal_id>/resolve', methods=['POST'])
+def admin_resolve_appeal(appeal_id):
+    """Admin-only: accept (moderation is undone) or decline an appeal."""
+    if session.get('username') != 'admin':
+        flash('You do not have permission to do that.', 'danger')
+        return redirect(url_for('feed'))
+
+    decision = request.form.get('decision')
+    if decision not in ('accept', 'decline'):
+        flash('Invalid decision.', 'warning')
+        return redirect(url_for('admin_appeals'))
+
+    response = request.form.get('admin_response', '').strip()[:APPEAL_MAX_LENGTH] or None
+
+    appeal = query_db('SELECT id, status FROM appeals WHERE id = ?', (appeal_id,), one=True)
+    if not appeal:
+        abort(404)
+    if appeal['status'] != 'pending':
+        flash('This appeal has already been resolved.', 'info')
+        return redirect(url_for('admin_appeals'))
+
+    new_status = 'accepted' if decision == 'accept' else 'declined'
+    db = get_db()
+    db.execute('''UPDATE appeals
+                   SET status = ?, admin_response = ?, resolved_at = CURRENT_TIMESTAMP, resolved_by = ?
+                   WHERE id = ?''', (new_status, response, session.get('user_id'), appeal_id))
+    db.commit()
+    flash('Appeal accepted: the moderation was undone.' if new_status == 'accepted'
+          else 'Appeal declined.', 'success')
+    return redirect(url_for('admin_appeals'))
 
 
 @app.route('/rules')

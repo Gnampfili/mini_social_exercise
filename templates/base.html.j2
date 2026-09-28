@@ -46,6 +46,11 @@
         <li class="nav-item">
           <a class="nav-link" href="/rules">Rules</a>
         </li>
+        {% if session.get('username') == 'admin' %}
+        <li class="nav-item">
+          <a class="nav-link" href="{{ url_for('admin_appeals') }}">Appeals{% if pending_appeals_count %} <span class="badge bg-danger">{{ pending_appeals_count }}</span>{% endif %}</a>
+        </li>
+        {% endif %}
         <li class="nav-item">
           <a class="nav-link" href="/privacy">Privacy</a>
         </li>
