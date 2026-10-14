@@ -1,12 +1,22 @@
 {% extends "base.html.j2" %}
 {% block content %}
-<div class="container col-md-6 mx-auto mt-5">
+<div class="container col-md-8 col-lg-7 mx-auto mt-4">
   <div class="card p-4">
-    <h2 class="mb-4 text-center">Sign Up</h2>
+    <h2 class="mb-1 text-center">Join Mini Social</h2>
+    <p class="text-center text-muted mb-4">
+      {% if active_users_count %}
+        {{ active_users_count }} {{ 'person is' if active_users_count == 1 else 'people are' }} already taking part. Two quick steps and you are one of them.
+      {% else %}
+        Two quick steps and you are in.
+      {% endif %}
+    </p>
+
     <form method="POST">
+
+      <h5 class="border-bottom pb-2 mb-3">Step 1: Your account</h5>
       <div class="mb-3">
         <label for="username" class="form-label">Username</label>
-        <input type="text" class="form-control" id="username" name="username" required>
+        <input type="text" class="form-control" id="username" name="username" value="{{ form.get('username', '') }}" required>
       </div>
       <div class="mb-3">
         <label for="password" class="form-label">Password</label>
@@ -14,20 +24,60 @@
       </div>
       <div class="mb-3">
         <label for="location" class="form-label">Location</label>
-        <input type="text" class="form-control" id="location" name="location">
+        <input type="text" class="form-control" id="location" name="location" value="{{ form.get('location', '') }}">
       </div>
       <div class="mb-3">
         <label for="birthdate" class="form-label">Birthdate</label>
-        <input type="date" class="form-control" id="birthdate" name="birthdate">
+        <input type="date" class="form-control" id="birthdate" name="birthdate" value="{{ form.get('birthdate', '') }}">
       </div>
-      <div class="mb-3">
+      <div class="mb-4">
         <label for="profile" class="form-label">Profile</label>
-        <textarea class="form-control" id="profile" name="profile" rows="3"></textarea>
+        <textarea class="form-control" id="profile" name="profile" rows="3">{{ form.get('profile', '') }}</textarea>
       </div>
-      <div class="d-grid">
+
+      <h5 class="border-bottom pb-2 mb-3">Step 2: Is this community right for you?</h5>
+      <p class="text-muted small">
+        We want a friendly, active community. Please answer honestly on a scale from
+        <strong>1 (not at all)</strong> to <strong>10 (absolutely)</strong>.
+      </p>
+
+      {% for q in scale_questions %}
+      <div class="mb-3">
+        <label class="form-label">{{ loop.index }}. {{ q.text }}</label>
+        <div class="btn-group flex-wrap" role="group" aria-label="{{ q.text }}">
+          {% for n in range(1, 11) %}
+            <input type="radio" class="btn-check" name="{{ q.id }}" id="{{ q.id }}_{{ n }}" value="{{ n }}"
+                   autocomplete="off" required {% if form.get(q.id) == n|string %}checked{% endif %}>
+            <label class="btn btn-outline-primary btn-sm" for="{{ q.id }}_{{ n }}">{{ n }}</label>
+          {% endfor %}
+        </div>
+      </div>
+      {% endfor %}
+
+      <h6 class="mt-4">Our community rules</h6>
+      <div class="card bg-light mb-3">
+        <ol class="mb-0 py-3 pe-3">
+          {% for rule in community_rules %}
+          <li class="mb-1">{{ rule }}</li>
+          {% endfor %}
+        </ol>
+      </div>
+      <p class="small text-muted">
+        The full moderation rules are on the <a href="/rules" target="_blank">Rules page</a>.
+      </p>
+      <div class="form-check mb-3">
+        <input class="form-check-input" type="checkbox" name="accept_rules" id="accept_rules" value="1"
+               required {% if form.get('accept_rules') %}checked{% endif %}>
+        <label class="form-check-label" for="accept_rules">
+          I have read the rules above and I accept them.
+        </label>
+      </div>
+
+      <div class="d-grid mt-4">
         <button type="submit" class="btn btn-primary">Sign Up</button>
       </div>
     </form>
+
     <div class="text-center mt-3">
       <small class="text-muted">
         Already have an account? <a href="/login">Login</a>
@@ -35,16 +85,4 @@
     </div>
   </div>
 </div>
-{% endblock %}```
-
-**Change Made:**
-*   Added the following block after the `</form>` tag:
-    ```html
-    <div class="text-center mt-3">
-      <small class="text-muted">
-        Already have an account? <a href="/login">Login</a>
-      </small>
-    </div>
-    ```
-
-These additions create a clear and user-friendly navigation path between your two main authentication pages.
+{% endblock %}

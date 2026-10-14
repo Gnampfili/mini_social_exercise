@@ -48,6 +48,7 @@
                         <th>Username</th>
                         <th>Profile Bio</th>
                         <th>Created At</th>
+                        <th>Fit Score</th>
                         <th>Risk Level</th>
                         <th>Actions</th>
                     </tr>
@@ -59,6 +60,13 @@
                         <td><a href="{{ url_for('user_profile', username=user.username) }}">{{ user.username }}</a></td>
                         <td style="max-width: 300px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="{{ user.profile or 'N/A' }}">{{ user.profile or 'N/A' }}</td>
                         <td>{{ user.created_at|datetimeformat }}</td>
+                        <td>
+                            {% if user.fit_score is not none %}
+                                {{ user.fit_score }}/10 {% if user.rules_accepted %}<span class="badge bg-success">rules accepted</span>{% endif %}
+                            {% else %}
+                                <span class="text-muted">&ndash;</span>
+                            {% endif %}
+                        </td>
                         <td>
                             {% if user.risk_label == "HIGH" %}
                                 <span class="badge bg-danger">HIGH</span>

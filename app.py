@@ -107,6 +107,40 @@ def init_appeal_tables():
 init_appeal_tables()
 
 
+def init_newcomer_tables():
+    """
+    Startup migration for the newcomer features.
+    - reactions.created_at: needed to know who was active in the last few days.
+      (SQLite cannot add a column with a non-constant default, so it is nullable and is set
+      explicitly whenever a reaction is created or changed; old reactions stay NULL = "not recent".)
+    - signup_surveys: stores each new member's questionnaire result.
+    """
+    conn = sqlite3.connect(DATABASE)
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(reactions)").fetchall()]
+    if 'created_at' not in columns:
+        conn.execute("ALTER TABLE reactions ADD COLUMN created_at TIMESTAMP")
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS signup_surveys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL UNIQUE,
+            fit_score REAL NOT NULL,
+            rules_accepted INTEGER NOT NULL,
+            answers TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+        )
+    ''')
+    # An earlier version of this table had a 'rules_correct' column (rules quiz); convert it.
+    survey_columns = [row[1] for row in conn.execute("PRAGMA table_info(signup_surveys)").fetchall()]
+    if 'rules_correct' in survey_columns:
+        conn.execute("ALTER TABLE signup_surveys RENAME COLUMN rules_correct TO rules_accepted")
+        conn.execute("UPDATE signup_surveys SET rules_accepted = 1")
+    conn.commit()
+    conn.close()
+
+
+init_newcomer_tables()
+
+
 def get_group_role(user_id, group_id):
     """Returns the caller's role ('admin'/'moderator'/'member') in a group, or None."""
     if not user_id or not group_id:
@@ -245,6 +279,32 @@ def inject_pending_appeals():
         row = query_db("SELECT COUNT(*) AS cnt FROM appeals WHERE status = 'pending'", one=True)
         return {'pending_appeals_count': row['cnt'] if row else 0}
     return {}
+
+
+#  Design Claim 9: show how many people already participate 
+ACTIVE_WINDOW_DAYS = 3
+
+
+def count_active_users(days=ACTIVE_WINDOW_DAYS):
+    """Number of distinct users who posted, commented or reacted in the last `days` days."""
+    row = query_db('''
+        SELECT COUNT(*) AS cnt FROM (
+            SELECT user_id FROM posts     WHERE created_at >= datetime('now', ?)
+            UNION
+            SELECT user_id FROM comments  WHERE created_at >= datetime('now', ?)
+            UNION
+            SELECT user_id FROM reactions WHERE created_at >= datetime('now', ?)
+        )
+    ''', (f'-{days} days',) * 3, one=True)
+    return row['cnt'] if row else 0
+
+
+@app.context_processor
+def inject_active_users():
+    """Only visitors who are not logged in see the counter (it is aimed at newcomers)."""
+    if session.get('user_id'):
+        return {}
+    return {'active_users_count': count_active_users(), 'active_window_days': ACTIVE_WINDOW_DAYS}
 
 
 REACTION_EMOJIS = {
@@ -599,6 +659,56 @@ def privacy():
     return render_template('privacy.html.j2')
 
 
+#  Design Claim 13: a separating task for newcomers 
+# Newcomers rate themselves on 1-10 scales (some questions are reverse-scored, so answering
+# "10" everywhere does not pass) and must read and accept the community rules.
+SIGNUP_SCALE_QUESTIONS = [
+    {'id': 'q_active',  'reverse': False, 'text': 'I am an active person who enjoys posting and joining discussions.'},
+    {'id': 'q_react',   'reverse': False, 'text': "I regularly react to or comment on other people's posts."},
+    {'id': 'q_rules',   'reverse': False, 'text': 'I am happy to follow community rules, even if I would have done things differently.'},
+    {'id': 'q_provoke', 'reverse': True,  'text': 'I enjoy provoking or insulting people online.'},
+    {'id': 'q_promote', 'reverse': True,  'text': 'I mainly want to use this platform to promote my own links or products.'},
+]
+COMMUNITY_RULES = [
+    'Be kind and respectful to everyone.',
+    'Do not insult, threaten or harass anyone.',
+    'Disagree politely: discuss ideas, do not attack people.',
+]
+MIN_FIT_SCORE = 7.0   # average of the (reverse-corrected) 1-10 answers; answering 10 everywhere only gives 6.4
+
+
+def evaluate_signup_survey(form):
+    """
+    Scores the questionnaire. Returns a dict with: problem (None, 'incomplete', 'rules' or 'fit'),
+    fit_score and the cleaned answers.
+    """
+    answers, scores = {}, []
+    for q in SIGNUP_SCALE_QUESTIONS:
+        try:
+            value = int(form.get(q['id'], ''))
+        except ValueError:
+            return {'problem': 'incomplete', 'fit_score': 0.0, 'answers': {}}
+        if not 1 <= value <= 10:
+            return {'problem': 'incomplete', 'fit_score': 0.0, 'answers': {}}
+        answers[q['id']] = value
+        scores.append(11 - value if q['reverse'] else value)
+
+    fit_score = round(sum(scores) / len(scores), 2)
+
+    if not form.get('accept_rules'):
+        return {'problem': 'rules', 'fit_score': fit_score, 'answers': answers}
+    if fit_score < MIN_FIT_SCORE:
+        return {'problem': 'fit', 'fit_score': fit_score, 'answers': answers}
+    return {'problem': None, 'fit_score': fit_score, 'answers': answers}
+
+
+def render_signup(form=None):
+    return render_template('signup.html.j2',
+                           form=form or {},
+                           scale_questions=SIGNUP_SCALE_QUESTIONS,
+                           community_rules=COMMUNITY_RULES)
+
+
 @app.route('/signup', methods=['GET', 'POST'])
 def signup():
     if request.method == 'POST':
@@ -607,6 +717,24 @@ def signup():
         location = request.form.get('location', '')
         birthdate = request.form.get('birthdate', '')
         profile = request.form.get('profile', '')
+
+        # The separating task comes first: no account is created unless it is passed.
+        survey = evaluate_signup_survey(request.form)
+        if survey['problem'] == 'incomplete':
+            flash('Please answer every question of the questionnaire.', 'warning')
+            return render_signup(request.form)
+        if survey['problem'] == 'rules':
+            flash('Please read and accept the community rules to create an account.', 'warning')
+            return render_signup(request.form)
+        if survey['problem'] == 'fit':
+            flash('Your answers suggest that this community may not be a good fit for you. '
+                  'If you answered too quickly, please reconsider and try again.', 'danger')
+            return render_signup(request.form)
+
+        # The users table has no UNIQUE constraint on username, so check explicitly.
+        if query_db('SELECT 1 FROM users WHERE username = ?', (username,), one=True):
+            flash('Username already taken. Please choose another one.', 'danger')
+            return render_signup(request.form)
 
         hashed_password = generate_password_hash(password)
 
@@ -617,10 +745,16 @@ def signup():
                 'INSERT INTO users (username, password, location, birthdate, profile) VALUES (?, ?, ?, ?, ?)',
                 (username, hashed_password, location, birthdate, profile)
             )
-            db.commit()
 
             # 1. Get the ID of the user we just created.
             new_user_id = cur.lastrowid
+
+            # Keep the questionnaire result so admins can review it.
+            cur.execute(
+                'INSERT INTO signup_surveys (user_id, fit_score, rules_accepted, answers) VALUES (?, ?, 1, ?)',
+                (new_user_id, survey['fit_score'], json.dumps(survey['answers']))
+            )
+            db.commit()
 
             # 2. Add user info to the session cookie.
             session.clear() # Clear any old session data
@@ -633,11 +767,12 @@ def signup():
 
         except sqlite3.IntegrityError:
             flash('Username already taken. Please choose another one.', 'danger')
+            return render_signup(request.form)
         finally:
             cur.close()
             db.close()
-            
-    return render_template('signup.html.j2')
+
+    return render_signup()
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -757,11 +892,11 @@ def add_reaction():
 
     if existing_reaction:
         # Step 2: If it exists, UPDATE the reaction_type.
-        db.execute('UPDATE reactions SET reaction_type = ? WHERE id = ?',
+        db.execute('UPDATE reactions SET reaction_type = ?, created_at = CURRENT_TIMESTAMP WHERE id = ?',
                    (new_reaction_type, existing_reaction['id']))
     else:
         # Step 3: If it does not exist, INSERT a new reaction.
-        db.execute('INSERT INTO reactions (post_id, user_id, reaction_type) VALUES (?, ?, ?)',
+        db.execute('INSERT INTO reactions (post_id, user_id, reaction_type, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
                    (post_id, user_id, new_reaction_type))
 
     db.commit()
@@ -908,6 +1043,10 @@ def admin_dashboard():
         user_dict['risk_label'] = risk_label
         user_dict['risk_sort_key'] = risk_sort_key
         user_dict['risk_score'] = min(5.0, round(user_risk_score, 2))
+        survey_row = query_db('SELECT fit_score, rules_accepted FROM signup_surveys WHERE user_id = ?',
+                              (user_dict['id'],), one=True)
+        user_dict['fit_score'] = survey_row['fit_score'] if survey_row else None
+        user_dict['rules_accepted'] = bool(survey_row['rules_accepted']) if survey_row else False
         all_users.append(user_dict)
 
     all_users.sort(key=lambda x: x['risk_score'], reverse=True)
@@ -1551,37 +1690,6 @@ def moderate_content(content):
 # Coding Assignment #3
 # Assignment 3.1
 
-# Common English words (plus common social-media filler/sentiment words) that
-# carry little topical signal, so they're excluded when building/matching
-# interest profiles for recommendations.
-STOPWORDS = {
-    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'and', 'or', 'but', 'to', 'of',
-    'in', 'on', 'for', 'with', 'this', 'that', 'these', 'those', 'it', 'its',
-    'i', 'you', 'we', 'my', 'your', 'our', 'their', 'they', 'he', 'she', 'his',
-    'her', 'them', 'us', 'am', 'been', 'being', 'at', 'be', 'as', 'so', 'if',
-    'me', 'im', 'just', 'not', 'have', 'has', 'had', 'do', 'did', 'does', 'from',
-    'by', 'about', 'up', 'out', 'all', 'can', 'will', 'would', 'could', 'should',
-    'here', 'there', 'now', 'when', 'while', 'after', 'before', 'still', 'even',
-    'some', 'other', 'because', 'into', 'over', 'back', 'down', 'off', 'again',
-    'never', 'always', 'every', 'one', 'two', 'first', 'next', 'new', 'got', 'get',
-    'getting', 'went', 'going', 'come', 'came', 'made', 'make', 'making', 'start',
-    'started', 'starting', 'end', 'little', 'small', 'big', 'lot', 'bit', 'more',
-    'most', 'than', 'too', 'very', 'like', 'love', 'loved', 'really', 'super',
-    'good', 'great', 'best', 'worth', 'amazing', 'awesome', 'nice', 'happy',
-    'excited', 'feel', 'feeling', 'feels', 'today', 'day', 'time', 'life',
-    'people', 'thing', 'things', 'know', 'think', 'want', 'need', 'finally',
-    'finished',
-}
-
-
-def _tokenize(text):
-    """Lowercases text and splits it into simple word tokens, dropping stopwords/short words."""
-    if not text:
-        return []
-    words = re.findall(r"[a-zA-Z']+", text.lower())
-    return [w for w in words if len(w) > 2 and w not in STOPWORDS]
-
-
 def recommend(user_id, filter_following):
     """
     Args:
@@ -1601,13 +1709,34 @@ def recommend(user_id, filter_following):
     - http://www.configworks.com/mz/handout_recsys_sac2010.pdf
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
+    import math
 
-    # A content-based recommender: build a TF-IDF-weighted bag-of-words profile
-    # of the topics the user has shown interest in (posts they reacted to or
-    # commented on), then rank other posts by how much they overlap with it.
-    # Words that show up in almost every post (like "finished" or "project")
-    # get down-weighted by IDF, so distinctive topic words (like "diy") drive
-    # the ranking instead.
+    # Content-based recommendation: build a TF-IDF weighted interest profile from the
+    # posts the user reacted to / commented on, then rank other posts by similarity.
+    stopwords = {
+        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'and', 'or', 'but', 'to', 'of',
+        'in', 'on', 'for', 'with', 'this', 'that', 'these', 'those', 'it', 'its',
+        'i', 'you', 'we', 'my', 'your', 'our', 'their', 'they', 'he', 'she', 'his',
+        'her', 'them', 'us', 'am', 'been', 'being', 'at', 'be', 'as', 'so', 'if',
+        'me', 'im', 'just', 'not', 'have', 'has', 'had', 'do', 'did', 'does', 'from',
+        'by', 'about', 'up', 'out', 'all', 'can', 'will', 'would', 'could', 'should',
+        'here', 'there', 'now', 'when', 'while', 'after', 'before', 'still', 'even',
+        'some', 'other', 'because', 'into', 'over', 'back', 'down', 'off', 'again',
+        'never', 'always', 'every', 'one', 'two', 'first', 'next', 'new', 'got', 'get',
+        'getting', 'went', 'going', 'come', 'came', 'made', 'make', 'making', 'start',
+        'started', 'starting', 'end', 'little', 'small', 'big', 'lot', 'bit', 'more',
+        'most', 'than', 'too', 'very', 'like', 'love', 'loved', 'really', 'super',
+        'good', 'great', 'best', 'worth', 'amazing', 'awesome', 'nice', 'happy',
+        'excited', 'feel', 'feeling', 'feels', 'today', 'day', 'time', 'life',
+        'people', 'thing', 'things', 'know', 'think', 'want', 'need', 'finally',
+        'finished',
+    }
+
+    def tokenize(text):
+        if not text:
+            return []
+        text = re.sub(r'(?:https?://|www\.)\S+', ' ', text.lower())  # URLs carry no topic signal
+        return [w for w in re.findall(r"[a-zA-Z']+", text) if len(w) > 2 and w not in stopwords]
 
     fallback_query = """
         SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
@@ -1619,11 +1748,11 @@ def recommend(user_id, filter_following):
         LIMIT 5
     """
 
-    # Logged-out users have no engagement history to build a profile from.
+    # Logged-out user: nothing to personalize on.
     if not user_id:
         return query_db(fallback_query)
 
-    #  1. Find the posts the user engaged with (reacted to or commented on) 
+    # 1. Posts the user engaged with (reacted to or commented on).
     engaged_posts = query_db('''
         SELECT DISTINCT p.id, p.content
         FROM posts p
@@ -1632,22 +1761,18 @@ def recommend(user_id, filter_following):
     ''', (user_id, user_id))
 
     if not engaged_posts:
-        # No engagement history yet -> nothing to personalize on.
         return query_db(fallback_query)
 
     engaged_post_ids = {row['id'] for row in engaged_posts}
 
-    #  2. Build the pool of candidate posts (posts we could recommend) 
+    # 2. Candidate posts: other people's posts (only followed users if requested).
     where_clauses = ["p.user_id != ?"]
     params = [user_id]
-
     if filter_following:
-        where_clauses.append(
-            "p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
-        )
+        where_clauses.append("p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)")
         params.append(user_id)
 
-    candidate_query = f"""
+    candidates = query_db(f"""
         SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
                p.group_id, gr.name as group_name
         FROM posts p
@@ -1655,64 +1780,60 @@ def recommend(user_id, filter_following):
         LEFT JOIN groups gr ON p.group_id = gr.id
         WHERE {' AND '.join(where_clauses)}
         ORDER BY p.created_at DESC
-        LIMIT 200
-    """
-    candidates = query_db(candidate_query, params)
+        LIMIT 5000
+    """, params)
 
     if not candidates:
         return query_db(fallback_query)
 
-    #  3. Compute IDF (inverse document frequency) over engaged + candidate posts 
-    # so common words are worth less and distinctive/topic words are worth more.
-    corpus_token_sets = [set(_tokenize(row['content'])) for row in engaged_posts]
-    corpus_token_sets += [set(_tokenize(row['content'])) for row in candidates]
-
+    # 3. Inverse document frequency: common words are worth less than distinctive ones.
+    corpus = [set(tokenize(r['content'])) for r in engaged_posts]
+    corpus += [set(tokenize(r['content'])) for r in candidates]
     doc_frequency = collections.Counter()
-    for token_set in corpus_token_sets:
+    for token_set in corpus:
         doc_frequency.update(token_set)
 
-    num_docs = len(corpus_token_sets)
-
     def idf(word):
-        return math.log((num_docs + 1) / (doc_frequency.get(word, 0) + 1)) + 1.0
+        return math.log((len(corpus) + 1) / (doc_frequency.get(word, 0) + 1)) + 1.0
 
-    #  4. Build the user's interest profile 
-    # Words that recur across several of the posts the user engaged with are a
-    # much stronger interest signal than a word that only appears once, so the
-    # profile is weighted by (how many liked posts contain the word) * idf,
-    # rather than raw term frequency.
+    # 4. Interest profile: how many engaged posts contain a word, times its IDF.
+    # With 3+ engaged posts only words recurring in at least two of them count.
     engaged_doc_frequency = collections.Counter()
     for row in engaged_posts:
-        engaged_doc_frequency.update(set(_tokenize(row['content'])))
+        engaged_doc_frequency.update(set(tokenize(row['content'])))
 
-    interest_profile = collections.Counter()
-    for word, freq_in_engaged in engaged_doc_frequency.items():
-        interest_profile[word] = freq_in_engaged * idf(word)
+    recurring = {w: f for w, f in engaged_doc_frequency.items() if f >= 2}
+    source = recurring if (len(engaged_posts) >= 3 and recurring) else engaged_doc_frequency
+    interest_profile = {word: freq * idf(word) for word, freq in source.items()}
 
     if not interest_profile:
         return query_db(fallback_query)
 
-    #  5. Score each candidate by how much it overlaps with the interest profile 
+    # 5. Score every candidate by overlap with the interest profile.
     scored = []
     for post in candidates:
         if post['id'] in engaged_post_ids:
-            continue  # Already seen/engaged with, don't recommend it again.
-        tokens = set(_tokenize(post['content']))
-        if not tokens:
             continue
-        overlap_score = sum(interest_profile.get(tok, 0.0) for tok in tokens)
-        if overlap_score > 0:
-            scored.append((overlap_score, post))
+        score = sum(interest_profile.get(tok, 0.0) for tok in set(tokenize(post['content'])))
+        if score > 0:
+            scored.append((score, post))
 
-    if not scored:
-        return query_db(fallback_query)
-
-    #  6. Take the 5 most relevant, then present them newest-first 
     scored.sort(key=lambda pair: pair[0], reverse=True)
-    top_posts = [post for _, post in scored[:5]]
-    top_posts.sort(key=lambda post: post['created_at'], reverse=True)
+    recommended_posts = [post for _, post in scored[:5]]
 
-    return top_posts
+    # Pad with the newest remaining candidates if there are fewer than 5 matches.
+    if len(recommended_posts) < 5:
+        chosen = {p['id'] for p in recommended_posts}
+        for post in candidates:
+            if len(recommended_posts) == 5:
+                break
+            if post['id'] not in chosen and post['id'] not in engaged_post_ids:
+                recommended_posts.append(post)
+
+    # 6. Reverse-chronological order, as required.
+    recommended_posts.sort(key=lambda post: post['created_at'], reverse=True)
+
+    return recommended_posts
 
 
 if __name__ == '__main__':
