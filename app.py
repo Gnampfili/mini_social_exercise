@@ -1738,19 +1738,26 @@ def recommend(user_id, filter_following):
         text = re.sub(r'(?:https?://|www\.)\S+', ' ', text.lower())  # URLs carry no topic signal
         return [w for w in re.findall(r"[a-zA-Z']+", text) if len(w) > 2 and w not in stopwords]
 
-    fallback_query = """
-        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
-               p.group_id, gr.name as group_name
-        FROM posts p
-        JOIN users u ON p.user_id = u.id
-        LEFT JOIN groups gr ON p.group_id = gr.id
-        ORDER BY p.created_at DESC
-        LIMIT 5
-    """
+    def fallback():
+        # The 5 newest posts (only from followed users if the "Following" filter is on).
+        where, params = "", ()
+        if filter_following and user_id:
+            where = "WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
+            params = (user_id,)
+        return query_db(f"""
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
+                   p.group_id, gr.name as group_name
+            FROM posts p
+            JOIN users u ON p.user_id = u.id
+            LEFT JOIN groups gr ON p.group_id = gr.id
+            {where}
+            ORDER BY p.created_at DESC
+            LIMIT 5
+        """, params)
 
     # Logged-out user: nothing to personalize on.
     if not user_id:
-        return query_db(fallback_query)
+        return fallback()
 
     # 1. Posts the user engaged with (reacted to or commented on).
     engaged_posts = query_db('''
@@ -1761,7 +1768,7 @@ def recommend(user_id, filter_following):
     ''', (user_id, user_id))
 
     if not engaged_posts:
-        return query_db(fallback_query)
+        return fallback()
 
     engaged_post_ids = {row['id'] for row in engaged_posts}
 
@@ -1784,7 +1791,7 @@ def recommend(user_id, filter_following):
     """, params)
 
     if not candidates:
-        return query_db(fallback_query)
+        return fallback()
 
     # 3. Inverse document frequency: common words are worth less than distinctive ones.
     corpus = [set(tokenize(r['content'])) for r in engaged_posts]
@@ -1807,7 +1814,7 @@ def recommend(user_id, filter_following):
     interest_profile = {word: freq * idf(word) for word, freq in source.items()}
 
     if not interest_profile:
-        return query_db(fallback_query)
+        return fallback()
 
     # 5. Score every candidate by overlap with the interest profile.
     scored = []
